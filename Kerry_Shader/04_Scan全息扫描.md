@@ -2,7 +2,7 @@
 日期: 2026-07-17T16:16:00
 tags:
 ---
-## 一、 涉及到的效果
+# 一、 涉及到的效果
 
 本 Shader 主要用于实现类似“科幻全息投影”、“能量护盾”或“物体扫描”的视觉特效，包含以下三个核心表现：
 
@@ -11,6 +11,11 @@ tags:
 - **动态扫描纹理（Flow Texture）**：在模型表面叠加一层不断移动的图案（如扫描线或能量波纹），产生动态效果。
 
 - **半透明混合（Transparent Blending）**：利用 `Blend SrcAlpha One`（叠加混合模式）和 `ZWrite Off`（关闭深度写入），使物体呈现非实体的光效堆叠质感。
+
+- 菲涅尔效应 : 随着距离变化而产生的反射效果/清晰度的变化
+		    在反射效果中，离你近的反射得更模糊，离你远的反射得更清晰
+  https://zhuanlan.zhihu.com/p/357190332
+
 
 
 ## 二、 核心数学原理
@@ -81,26 +86,91 @@ $$S = S_0 + v \times t$$
 
 ### 2. 顶点着色器 (Vertex Shader)
 
-**核心任务：准备数据。**
+顶点着色器的主要任务是**把片元着色器需要用到的各种“世界空间”数据计算好并传递下去**。在这个特效中，世界空间坐标尤为重要。
 
-- 计算顶点在裁剪空间的位置 `o.pos = UnityObjectToClipPos(v.vertex)`（必须项）。
+1. **`o.pos`**: 常规的 MVP 矩阵变换，将顶点从模型空间转换到裁剪空间，用于最终屏幕上的位置显示。
 
-- 计算并传递世界空间的**法线** (`o.normal_world`)、**顶点位置** (`o.pos_world`)。
+2. **`normal_world` & `pos_world`**: 计算世界空间下的法线方向和顶点位置。这是后续计算“视线与法线夹角（边缘光）”的必需数据。
 
-- 计算模型的**世界中心点** (`o.pivot_world`)，用于后续计算局部 UV 坐标。
+3. **`o.pivot_world`**: 这是一个很巧妙的操作。通过将本地坐标的原点 `float4(0,0,0,1)` 转换到世界空间，求出了**当前物体中心点（Pivot）的世界坐标**。这将在片元阶段用来生成不易受物体位移影响的流光 UV。
 
+4. **`o.uv`**: 传递模型自带的基础 UV，用于读取遮罩/发光贴图。
 
 ### 3. 片元着色器 (Fragment Shader)
+<br>
 
-**核心任务：计算最终颜色与透明度。**
+##### 1. 边缘光效层（Rim Light / Fresnel）
 
-- **计算 Fresnel**：通过法线与视线的点乘计算出边缘光强度，并用 `smoothstep` 约束光晕范围。
+``` hlsl
+half3 normal_world = normalize(i.normal_world);
+half3 view_world = normalize(_WorldSpaceCameraPos.xyz - i.pos_world);
+half NdotV = saturate(dot(normal_world,view_world));
+half fresnel = 1.0 - NdotV;
+fresnel = smoothstep(_RimMin,_RimMax,fresnel);
+```
 
-- **采样贴图并融合**：提取主贴图和发光颜色，使用 `lerp` 在基础色和边缘光色之间插值。
+- **思路**：利用菲涅尔效应（Fresnel）制作边缘发光。通过点乘法线（`normal_world`）和视线方向（`view_world`）得到 `NdotV`。视线垂直于表面的地方值为1，平行（边缘）的地方值为0。
+    
+- `1.0 - NdotV` 将其反转，使得**物体边缘处值最大（最亮）**。
+    
+- `smoothstep` 用于平滑并控制边缘光的宽窄和硬度。
+<br>
+##### 2. 局部高亮层（Emissive Mask）
 
-- **UV 动画偏移**：根据时间计算新的 UV 坐标，采样流动贴图。
+```hlsl
+half4 emiss = tex2D(_MainTex,i.uv).r;
+emiss = pow(emiss,5.0);
+half final_fresnel = saturate(fresnel + emiss);
+```
 
-- **最终输出**：将边缘光颜色与流动贴图颜色相加，并计算最终的透明度（Alpha），组合成 `float4` 输出屏幕。
+- **思路**：读取主贴图（`_MainTex`）的 R 通道作为额外的发光遮罩。
+    
+- 使用 `pow(emiss, 5.0)` 是一个经典的图形学技巧，用来**大幅度增加对比度**，把灰暗的区域压黑，只保留贴图中最亮的点。
+    
+- 最后将“贴图发光”和“边缘发光”相加（`saturate` 防止溢出），整合成最终的发光强度 `final_fresnel`。
+<br>
+##### 3. 基础颜色与边缘光混合
+
+```hlsl
+half3 final_rim_color = lerp(_InnerColor.xyz , _RimColor.xyz * _RimIntensity,final_fresnel);
+half final_rim_alpha = final_fresnel;
+```
+
+- **思路**：使用上面计算出的发光强度作为插值系数（`lerp`）。
+    
+- 物体中心部位（发光弱的地方）显示为 `_InnerColor`（内部基础色）。
+    
+- 物体边缘或贴图高亮部位显示为带有强度的边缘光颜色 `_RimColor * _RimIntensity`。
+    
+- 透明度（Alpha）也直接由发光强度决定，意味着不发光的地方会变成透明的。
+<br>
+##### 4. 世界空间流动特效层（Flow Map）
+
+```hlsl
+half2 uv_flow = (i.pos_world.xy - i.pivot_world.xy) * _FlowTilling.xy;
+uv_flow = uv_flow + _Time.y * _FlowSpeed.xy;
+float4 flow_rgba = tex2D(_FlowTex,uv_flow) * _FlowIntensity;
+```
+
+- **思路**：制作一个在物体表面移动的流光图案。
+    
+- 这里**没有使用模型自带的 UV**，而是使用了 `(pos_world.xy - pivot_world.xy)`。这是一种基于世界空间 XY 平面的平面投影映射（Planar Mapping）。
+    
+- 减去 `pivot_world` 的作用是：确保流光纹理是**锚定在物体身上的**。如果物体在世界空间中移动，流光贴图不会跟着世界坐标滑动产生“穿帮”，而是相对物体原点保持一致。
+    
+- `+ _Time.y * _FlowSpeed.xy` 让贴图随着时间滚动起来。
+<br>
+##### 5. 最终输出合成
+
+```hlsl
+float3 final_col = final_rim_color + flow_rgba.xyz;
+float final_alpha = saturate(final_rim_alpha + flow_rgba.a + _InnerAlpha);
+return float4(final_col , final_alpha);
+```
+
+- **思路**：将底层的边缘光/基础色（`final_rim_color`）与表层的流光（`flow_rgba.xyz`）进行**加法混合（Additive Blending）**。
+    
+- 透明度也同样进行累加，并加上一个基础保底透明度 `_InnerAlpha`，最后截断到 0~1 输出。
 
 
 ## 四、 代码实现难点
