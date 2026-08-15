@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>2D 动态 FEM · 隐式欧拉(Backward Euler)</title>
+<style>
+  body { margin:0; background:#16161f; color:#e8e8f0; font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  #wrap { display:flex; gap:20px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
+  .panel { background:#0f0f16; border:1px solid #2a2a3a; border-radius:8px; padding:10px; }
+  canvas { display:block; background:#0f0f16; }
+  .cap { text-align:center; font-size:13px; color:#9aa0b0; margin-top:6px; }
+  #ui { width:280px; font-size:14px; line-height:1.6; }
+  #ui h3 { margin:0 0 8px; }
+  label { display:block; margin:10px 0; }
+  input[type=range] { width:100%; }
+  .val { color:#6fb3ff; }
+  p { color:#9aa0b0; font-size:13px; }
+  button { margin:4px 6px 0 0; padding:6px 14px; background:#3a6ea5; color:#fff; border:none; border-radius:4px; cursor:pointer; }
+  #info { margin-top:12px; padding:8px 10px; background:#1a1a28; border-radius:6px; font-family:monospace; font-size:12px; color:#b8e0b8; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div class="panel"><canvas id="cv" width="620" height="620"></canvas>
+    <div class="cap">软体自由落体 → 撞击地面 → 压缩反弹(共旋 FEM + 隐式欧拉)</div>
+  </div>
+  <div id="ui">
+    <h3>2D 动态 FEM · 隐式欧拉</h3>
+    <p>一块软方块自由落体,底部先撞地、内部传播压缩波、弹跳几下后静止。这是[[迪士尼 FEM 蒙皮]]里"隐式时间积分"的实时版(无条件稳定,不爆炸)。</p>
+    <label>重力 g <span class="val" id="gVal">30</span>
+      <input type="range" id="g" min="0" max="80" step="1" value="30"></label>
+    <label>杨氏模量 E(软→硬) <span class="val" id="EVal">3000</span>
+      <input type="range" id="E" min="200" max="8000" step="100" value="3000"></label>
+    <label>泊松比 ν <span class="val" id="nuVal">0.30</span>
+      <input type="range" id="nu" min="0.05" max="0.45" step="0.01" value="0.30"></label>
+    <label>阻尼(速度衰减) <span class="val" id="dampVal">0.99</span>
+      <input type="range" id="damp" min="0.90" max="1.00" step="0.001" value="0.99"></label>
+    <label>恢复系数(反弹) <span class="val" id="restVal">0.35</span>
+      <input type="range" id="rest" min="0" max="0.9" step="0.05" value="0.35"></label>
+    <button id="pause">暂停/继续</button>
+    <button id="reset">重置</button>
+    <div id="info">初始化…</div>
+    <p style="margin-top:10px">调低 E 看"软体瘫软",调高 E 看"硬块弹跳";ν 接近 0.45 时体积保持明显。隐式欧拉即:<br><code>(M − h²K)Δv = h(f + hKv + f_ext)</code></p>
+  </div>
+</div>
+<script>
+"use strict";
+// ============ 2x2 矩阵工具 ============
+const det2  = m => m[0][0]*m[1][1] - m[0][1]*m[1][0];
+const inv2  = m => { const d=det2(m); return [[ m[1][1]/d,-m[0][1]/d],[-m[1][0]/d, m[0][0]/d]]; };
+const mul2  = (a,b)=> [[a[0][0]*b[0][0]+a[0][1]*b[1][0], a[0][0]*b[0][1]+a[0][1]*b[1][1]],
+                       [a[1][0]*b[0][0]+a[1][1]*b[1][0], a[1][0]*b[0][1]+a[1][1]*b[1][1]]];
+const trans2= a => [[a[0][0],a[1][0]],[a[0][1],a[1][1]]];
+
+// ============ 1. 网格:正方形软块 ============
+const npx=7, npy=7, half=0.7, cy0=2.0;   // 7x7 节点,边长 1.4,初始中心 y=2
+const X=[]; const nid=(i,j)=>j*npx+i;
+for (let j=0;j<npy;j++) for (let i=0;i<npx;i++)
+  X.push([ -half + i*(2*half/(npx-1)), cy0 - half + j*(2*half/(npy-1)) ]);
+
+const tris=[];
+for (let j=0;j<npy-1;j++) for (let i=0;i<npx-1;i++){
+  const a=nid(i,j), b=nid(i+1,j), c=nid(i+1,j+1), d=nid(i,j+1);
+  tris.push([a,b,c]); tris.push([a,c,d]);
+}
+
+const n = X.length;                       // 节点数
+const N = 2*n;                            // 自由度
+const floorY = -2.0;                      // 地面高度
+
+// ============ 2. 材料 ============
+let mu=0, lam=0;
+function setMaterial(E, nu){ mu=E/(2*(1+nu)); lam=E*nu/((1+nu)*(1-2*nu)); }
+
+// ============ 3. 三角形几何 + 集中质量 ============
+const Dm_inv=[], A0=[], m=new Float64Array(n);
+const grads=[[-1,-1],[1,0],[0,1]];
+const density = 1.0;
+for (const t of tris){
+  const X0=X[t[0]], X1=X[t[1]], X2=X[t[2]];
+  const Dm=[[X1[0]-X0[0], X2[0]-X0[0]],[X1[1]-X0[1], X2[1]-X0[1]]];
+  Dm_inv.push(inv2(Dm));
+  const a0=0.5*Math.abs(det2(Dm));
+  A0.push(a0);
+  for (const id of t) m[id]+=a0*density/3;   // 集中质量:面积贡献/3
+}
+
+// ============ 4. 极分解(闭式) ============
+function polarR(F){
+  if (det2(F)<=1e-12) return [[1,0],[0,1]];
+  const S=mul2(trans2(F),F), s11=S[0][0], s12=S[0][1], s22=S[1][1];
+  const delta=Math.sqrt(Math.max(s11*s22-s12*s12,1e-12));
+  const t=Math.sqrt(s11+s22+2*delta);
+  const invSqrt=[[(s22+delta)/(delta*t),(-s12)/(delta*t)],[(-s12)/(delta*t),(s11+delta)/(delta*t)]];
+  return mul2(F,invSqrt);
+}
+
+// ============ 5. 内力(与静态版一致) ============
+function forces(x){
+  const f=x.map(()=>[0,0]);
+  for (let k=0;k<tris.length;k++){
+    const [i0,i1,i2]=tris[k];
+    const x0=x[i0],x1=x[i1],x2=x[i2];
+    const Ds=[[x1[0]-x0[0], x2[0]-x0[0]],[x1[1]-x0[1], x2[1]-x0[1]]];
+    const F=mul2(Ds, Dm_inv[k]);
+    const J=det2(F), R=polarR(F), FinvT=trans2(inv2(F));
+    const P=[[2*mu*(F[0][0]-R[0][0])+lam*(J-1)*J*FinvT[0][0], 2*mu*(F[0][1]-R[0][1])+lam*(J-1)*J*FinvT[0][1]],
+             [2*mu*(F[1][0]-R[1][0])+lam*(J-1)*J*FinvT[1][0], 2*mu*(F[1][1]-R[1][1])+lam*(J-1)*J*FinvT[1][1]]];
+    const g=trans2(Dm_inv[k]);
+    for (let v=0;v<3;v++){
+      const gn=grads[v];
+      const ggn=[g[0][0]*gn[0]+g[0][1]*gn[1], g[1][0]*gn[0]+g[1][1]*gn[1]];
+      const Pg=[P[0][0]*ggn[0]+P[0][1]*ggn[1], P[1][0]*ggn[0]+P[1][1]*ggn[1]];
+      const idx=[i0,i1,i2][v];
+      f[idx][0]-=A0[k]*Pg[0]; f[idx][1]-=A0[k]*Pg[1];
+    }
+  }
+  return f;
+}
+
+// ============ 6. 高斯消元 ============
+function gauss(A,b,nn){
+  const M=new Float64Array(A), x=new Float64Array(b);
+  for (let col=0;col<nn;col++){
+    let piv=col,maxv=Math.abs(M[col*nn+col]);
+    for (let r=col+1;r<nn;r++){ const vv=Math.abs(M[r*nn+col]); if(vv>maxv){maxv=vv;piv=r;} }
+    if (maxv<1e-12) continue;
+    if (piv!==col){
+      for (let c=0;c<nn;c++){ const t=M[col*nn+c]; M[col*nn+c]=M[piv*nn+c]; M[piv*nn+c]=t; }
+      const t=x[col]; x[col]=x[piv]; x[piv]=t;
+    }
+    const inv=1/M[col*nn+col];
+    for (let c=col;c<nn;c++) M[col*nn+c]*=inv;
+    x[col]*=inv;
+    for (let r=0;r<nn;r++){
+      if (r===col) continue;
+      const ff=M[r*nn+col]; if (Math.abs(ff)<1e-16) continue;
+      for (let c=col;c<nn;c++) M[r*nn+c]-=ff*M[col*nn+c];
+      x[r]-=ff*x[col];
+    }
+  }
+  return x;
+}
+
+// ============ 7. 状态 + 重置 ============
+let x=[], v=new Float64Array(N), g, damping, restitution, friction=0.6, running=true;
+function reset(){
+  setMaterial(parseFloat(EInput.value), parseFloat(nuInput.value));
+  g=parseFloat(gInput.value); damping=parseFloat(dampInput.value); restitution=parseFloat(restInput.value);
+  x=X.map(p=>p.slice());
+  v=new Float64Array(N);
+  // 给一点初始角速度,让掉落更生动(绕质心旋转)
+  const omega=0.6, cx=0, cyc=cy0;
+  for (let i=0;i<n;i++){
+    const rx=x[i][0]-cx, ry=x[i][1]-cyc;
+    v[2*i]   = -omega*ry;
+    v[2*i+1] =  omega*rx;
+  }
+}
+
+// ============ 8. 隐式欧拉时间步 ============
+function step(h){
+  const f=forces(x);
+  // 切线刚度 K = ∂f/∂x(数值差分)
+  const K=new Float64Array(N*N), hh=1e-5;
+  for (let j=0;j<N;j++){
+    const xp=x.map(p=>[p[0],p[1]]);
+    xp[(j>>1)][j&1]+=hh;
+    const fp=forces(xp);
+    for (let i=0;i<N;i++) K[i*N+j]=(fp[i>>1][i&1]-f[i>>1][i&1])/hh;
+  }
+  // 组装 (M - h²K) Δv = h(f + hKv + f_ext)
+  const A=new Float64Array(N*N), b=new Float64Array(N);
+  for (let i=0;i<N;i++){
+    const ni=i>>1, ci=i&1, mi=m[ni];
+    let Kv=0;
+    for (let k=0;k<N;k++) Kv+=K[i*N+k]*v[k];
+    b[i]=h*(f[ni][ci] + h*Kv + (ci===1 ? -mi*g : 0));
+    for (let j=0;j<N;j++) A[i*N+j]=-h*h*K[i*N+j];
+    A[i*N+i]+=mi;                          // M 对角
+  }
+  const dv=gauss(A,b,N);
+  for (let i=0;i<N;i++) v[i]+=dv[i];
+  for (let i=0;i<n;i++){ x[i][0]+=h*v[2*i]; x[i][1]+=h*v[2*i+1]; }
+  // 阻尼(内部/空气阻力)
+  for (let i=0;i<N;i++) v[i]*=damping;
+  // 地面碰撞(节点级)
+  for (let i=0;i<n;i++){
+    if (x[i][1]<floorY){
+      x[i][1]=floorY;
+      if (v[2*i+1]<0) v[2*i+1]*=-restitution;   // 法向反弹
+      v[2*i]*=friction;                          // 切向摩擦
+    }
+  }
+}
+
+// ============ 9. 绘制 ============
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+function toScreen(px,py){
+  const scale=95;
+  return [cv.width/2+px*scale, cv.height/2-py*scale];
+}
+function draw(){
+  ctx.clearRect(0,0,cv.width,cv.height);
+  // 地面
+  const [gx0,gy0]=toScreen(-2.4,floorY), [gx1]=toScreen(2.4,floorY);
+  ctx.strokeStyle='#5a5a6e'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(gx0,gy0); ctx.lineTo(gx1,gy0); ctx.stroke();
+  // rest 参照(淡)
+  ctx.strokeStyle='rgba(120,130,160,0.22)'; ctx.lineWidth=1;
+  for (const t of tris){
+    ctx.beginPath();
+    let [sx,sy]=toScreen(X[t[0]][0],X[t[0]][1]); ctx.moveTo(sx,sy);
+    for (const id of t.slice(1)){ [sx,sy]=toScreen(X[id][0],X[id][1]); ctx.lineTo(sx,sy); }
+    ctx.closePath(); ctx.stroke();
+  }
+  // 当前网格
+  ctx.strokeStyle='#4a6a9a'; ctx.lineWidth=1.4;
+  for (const t of tris){
+    ctx.beginPath();
+    let [sx,sy]=toScreen(x[t[0]][0],x[t[0]][1]); ctx.moveTo(sx,sy);
+    for (const id of t.slice(1)){ [sx,sy]=toScreen(x[id][0],x[id][1]); ctx.lineTo(sx,sy); }
+    ctx.closePath(); ctx.stroke();
+  }
+  // 节点
+  ctx.fillStyle='#6fb3ff';
+  for (let i=0;i<n;i++){
+    const [sx,sy]=toScreen(x[i][0],x[i][1]);
+    ctx.beginPath(); ctx.arc(sx,sy,2.4,0,Math.PI*2); ctx.fill();
+  }
+}
+
+// ============ 10. 主循环 + UI ============
+const gInput=document.getElementById('g'), EInput=document.getElementById('E'),
+      nuInput=document.getElementById('nu'), dampInput=document.getElementById('damp'),
+      restInput=document.getElementById('rest');
+const gVal=document.getElementById('gVal'), EVal=document.getElementById('EVal'),
+      nuVal=document.getElementById('nuVal'), dampVal=document.getElementById('dampVal'),
+      restVal=document.getElementById('restVal');
+const info=document.getElementById('info');
+const pauseBtn=document.getElementById('pause'), resetBtn=document.getElementById('reset');
+
+function syncLabels(){
+  gVal.textContent=gInput.value; EVal.textContent=EInput.value;
+  nuVal.textContent=parseFloat(nuInput.value).toFixed(2);
+  dampVal.textContent=parseFloat(dampInput.value).toFixed(3);
+  restVal.textContent=parseFloat(restInput.value).toFixed(2);
+}
+
+let lastT=performance.now(), fpsAcc=0, fpsN=0;
+function loop(now){
+  requestAnimationFrame(loop);
+  const dt=Math.min((now-lastT)/1000, 0.05); lastT=now;
+  if (running){
+    step(1/60);                              // 固定子步
+    fpsAcc+=dt; fpsN++;
+    if (fpsAcc>=0.5){
+      const vel=Math.hypot(v[0],v[1]);
+      info.textContent=`帧率 ${(fpsN/fpsAcc).toFixed(0)}fps\n节点 ${n} · 三角形 ${tris.length}\n质心y=${(x.reduce((s,p)=>s+p[1],0)/n).toFixed(3)} · 底部y=${(Math.min(...x.map(p=>p[1]))).toFixed(3)}\n首节点速度=${vel.toFixed(2)}`;
+      fpsAcc=0; fpsN=0;
+    }
+  }
+  draw();
+}
+
+[gInput,EInput,nuInput,dampInput,restInput].forEach(el=>el.addEventListener('input',()=>{ syncLabels(); reset(); }));
+pauseBtn.addEventListener('click',()=>{ running=!running; pauseBtn.textContent=running?'暂停/继续':'继续'; });
+resetBtn.addEventListener('click', reset);
+
+reset(); syncLabels(); draw();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>2D 共旋 FEM · 线性三角单元</title>
+<style>
+  body { margin:0; background:#16161f; color:#e8e8f0; font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  #wrap { display:flex; gap:20px; padding:20px; align-items:flex-start; flex-wrap:wrap; }
+  .panel { background:#0f0f16; border:1px solid #2a2a3a; border-radius:8px; padding:10px; }
+  canvas { display:block; background:#0f0f16; }
+  .cap { text-align:center; font-size:13px; color:#9aa0b0; margin-top:6px; }
+  #ui { width:280px; font-size:14px; line-height:1.6; }
+  #ui h3 { margin:0 0 8px; }
+  label { display:block; margin:12px 0; }
+  input[type=range] { width:100%; }
+  .val { color:#6fb3ff; }
+  p { color:#9aa0b0; font-size:13px; }
+  #info { margin-top:14px; padding:8px 10px; background:#1a1a28; border-radius:6px; font-family:monospace; font-size:12px; color:#b8e0b8; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div class="panel"><canvas id="rest" width="360" height="360"></canvas><div class="cap">Rest(未变形)</div></div>
+  <div class="panel"><canvas id="deform" width="360" height="360"></canvas><div class="cap">Deformed(变形后,浅色为 rest 参照)</div></div>
+  <div id="ui">
+    <h3>2D 共旋 FEM · 线性三角单元</h3>
+    <p>左边界钉住的软杆,右端中点受向下载荷,用 Newton 迭代解平衡形变。这是[[迪士尼 FEM 蒙皮]]那套共旋弹性公式的 2D 版。</p>
+    <label>载荷(向下力) <span class="val" id="loadVal">20</span>
+      <input type="range" id="load" min="0" max="100" step="1" value="20"></label>
+    <label>杨氏模量 E(软→硬) <span class="val" id="EVal">1000</span>
+      <input type="range" id="E" min="100" max="5000" step="50" value="1000"></label>
+    <label>泊松比 ν <span class="val" id="nuVal">0.30</span>
+      <input type="range" id="nu" min="0.05" max="0.45" step="0.01" value="0.30"></label>
+    <div id="info">计算中…</div>
+    <p style="margin-top:12px">注意:泊松比接近 0.5(不可压缩)时体积保持最强;E 越大越"硬",同样载荷下变形越小。调大载荷看杆子明显弯曲。</p>
+  </div>
+</div>
+<script>
+"use strict";
+// ============ 2x2 矩阵小工具 ============
+const det2  = m => m[0][0]*m[1][1] - m[0][1]*m[1][0];
+const inv2  = m => { const d=det2(m); return [[ m[1][1]/d, -m[0][1]/d],[-m[1][0]/d, m[0][0]/d]]; };
+const mul2  = (a,b) => [[ a[0][0]*b[0][0]+a[0][1]*b[1][0], a[0][0]*b[0][1]+a[0][1]*b[1][1]],
+                        [ a[1][0]*b[0][0]+a[1][1]*b[1][0], a[1][0]*b[0][1]+a[1][1]*b[1][1]]];
+const trans2= a => [[a[0][0],a[1][0]],[a[0][1],a[1][1]]];
+
+// ============ 1. 网格 ============
+const nx=12, ny=4;                     // 节点网格
+const Lx=3.0, Ly=1.0;
+const X=[];                             // rest 坐标
+const nid=(i,j)=>j*nx+i;
+for (let j=0;j<ny;j++) for (let i=0;i<nx;i++) X.push([i*Lx/(nx-1), j*Ly/(ny-1)]);
+
+const tris=[];
+for (let j=0;j<ny-1;j++) for (let i=0;i<nx-1;i++){
+  const a=nid(i,j), b=nid(i+1,j), c=nid(i+1,j+1), d=nid(i,j+1);
+  tris.push([a,b,c]); tris.push([a,c,d]);
+}
+const fixed=[]; for (let j=0;j<ny;j++) fixed.push(nid(0,j));
+const loadNode = nid(nx-1, Math.floor(ny/2));
+
+// ============ 2. 材料(由 E, nu 动态算) ============
+let mu=0, lam=0;
+function setMaterial(E, nu){
+  mu  = E/(2*(1+nu));
+  lam = E*nu/((1+nu)*(1-2*nu));
+}
+
+// ============ 3. 三角形几何预计算 ============
+const Dm_inv=[], A0=[];
+const grads = [[-1,-1],[1,0],[0,1]];    // 参考三角形梯度 dN
+for (const t of tris){
+  const X0=X[t[0]], X1=X[t[1]], X2=X[t[2]];
+  const Dm=[[X1[0]-X0[0], X2[0]-X0[0]],[X1[1]-X0[1], X2[1]-X0[1]]];
+  Dm_inv.push(inv2(Dm));
+  A0.push(0.5*Math.abs(det2(Dm)));
+}
+
+// ============ 4. 极分解 R = F (F^T F)^(-1/2)(闭式,2x2) ============
+function polarR(F){
+  if (det2(F) <= 1e-12) return [[1,0],[0,1]];   // 退化保护
+  const S = mul2(trans2(F), F);                 // F^T F(对称正定)
+  const s11=S[0][0], s12=S[0][1], s22=S[1][1];
+  const delta = Math.sqrt(Math.max(s11*s22 - s12*s12, 1e-12));
+  const t = Math.sqrt(s11 + s22 + 2*delta);
+  const invSqrt = [[ (s22+delta)/(delta*t), (-s12)/(delta*t)],
+                   [ (-s12)/(delta*t),      (s11+delta)/(delta*t)]];
+  return mul2(F, invSqrt);                      // R = F S^(-1/2)
+}
+
+// ============ 5. 内力(所有三角形合力) ============
+function forces(x){
+  const f = x.map(()=>[0,0]);
+  for (let k=0;k<tris.length;k++){
+    const [i0,i1,i2]=tris[k];
+    const x0=x[i0],x1=x[i1],x2=x[i2];
+    const Ds=[[x1[0]-x0[0], x2[0]-x0[0]],[x1[1]-x0[1], x2[1]-x0[1]]];
+    const F=mul2(Ds, Dm_inv[k]);
+    const J=det2(F);
+    const R=polarR(F);
+    const FinvT=trans2(inv2(F));
+    // 第一 PK 应力:P = 2mu(F-R) + lam(J-1)J F^{-T}
+    const P=[[ 2*mu*(F[0][0]-R[0][0]) + lam*(J-1)*J*FinvT[0][0], 2*mu*(F[0][1]-R[0][1]) + lam*(J-1)*J*FinvT[0][1] ],
+             [ 2*mu*(F[1][0]-R[1][0]) + lam*(J-1)*J*FinvT[1][0], 2*mu*(F[1][1]-R[1][1]) + lam*(J-1)*J*FinvT[1][1] ]];
+    const g=trans2(Dm_inv[k]);                 // Dm^{-T}
+    for (let v=0;v<3;v++){
+      const gn=grads[v];
+      const ggn=[ g[0][0]*gn[0]+g[0][1]*gn[1], g[1][0]*gn[0]+g[1][1]*gn[1] ];
+      const Pggn=[ P[0][0]*ggn[0]+P[0][1]*ggn[1], P[1][0]*ggn[0]+P[1][1]*ggn[1] ];
+      const idx=[i0,i1,i2][v];
+      f[idx][0]-=A0[k]*Pggn[0];
+      f[idx][1]-=A0[k]*Pggn[1];
+    }
+  }
+  return f;
+}
+
+// ============ 6. 高斯消元(解 K dx = r) ============
+function gauss(A, b, n){
+  const M=new Float64Array(A), x=new Float64Array(b);
+  for (let col=0; col<n; col++){
+    let piv=col, maxv=Math.abs(M[col*n+col]);
+    for (let r=col+1;r<n;r++){ const v=Math.abs(M[r*n+col]); if(v>maxv){maxv=v;piv=r;} }
+    if (maxv<1e-12) continue;
+    if (piv!==col){
+      for (let c=0;c<n;c++){ const t=M[col*n+c]; M[col*n+c]=M[piv*n+c]; M[piv*n+c]=t; }
+      const t=x[col]; x[col]=x[piv]; x[piv]=t;
+    }
+    const inv=1/M[col*n+col];
+    for (let c=col;c<n;c++) M[col*n+c]*=inv;
+    x[col]*=inv;
+    for (let r=0;r<n;r++){
+      if (r===col) continue;
+      const f=M[r*n+col];
+      if (Math.abs(f)<1e-16) continue;
+      for (let c=col;c<n;c++) M[r*n+c]-=f*M[col*n+c];
+      x[r]-=f*x[col];
+    }
+  }
+  return x;
+}
+
+// ============ 7. Newton 迭代(切线刚度用有限差分) ============
+function solve(loadMag){
+  setMaterial(parseFloat(EInput.value), parseFloat(nuInput.value));
+  const n=X.length, N=2*n;
+  let x=X.map(p=>p.slice());                 // 从 rest 开始
+  const load=X.map(()=>[0,0]);
+  load[loadNode][1]=-loadMag;                // 向下载荷
+
+  let iters=0;
+  for (let it=0; it<60; it++){
+    iters=it+1;
+    const f=forces(x);
+    const r=new Float64Array(N);             // 残差 = 外载荷 - 内力
+    for (let i=0;i<n;i++){ r[2*i]=load[i][0]-f[i][0]; r[2*i+1]=load[i][1]-f[i][1]; }
+
+    const K=new Float64Array(N*N), h=1e-5;   // 数值切线刚度 K=∂f/∂x
+    for (let j=0;j<N;j++){
+      const xp=x.map(p=>p.slice());
+      xp[Math.floor(j/2)][j%2]+=h;
+      const fp=forces(xp);
+      for (let i=0;i<N;i++){
+        const ni=Math.floor(i/2), ci=i%2;
+        K[i*N+j]=(fp[ni][ci]-f[ni][ci])/h;
+      }
+    }
+    for (const node of fixed){               // 固定节点:dx=0
+      for (const c of [0,1]){
+        const idx=2*node+c;
+        for (let k=0;k<N;k++){ K[idx*N+k]=0; K[k*N+idx]=0; }
+        K[idx*N+idx]=1; r[idx]=0;
+      }
+    }
+    const dx=gauss(K, r, N);                 // 解 K dx = r
+    let maxDx=0;
+    for (let i=0;i<n;i++){ x[i][0]+=dx[2*i]; x[i][1]+=dx[2*i+1]; maxDx=Math.max(maxDx, Math.abs(dx[2*i]), Math.abs(dx[2*i+1])); }
+    if (maxDx < 1e-6) break;
+  }
+  const disp = X[loadNode][1] - x[loadNode][1];   // 载荷点向下位移
+  return {x, iters, disp};
+}
+
+// ============ 8. 绘制 ============
+function toScreen(px, py, cv){
+  const scale=95, margin=30;
+  const sx = margin + (px + 0.5)*scale;
+  const sy = cv.height/2 - py*scale;
+  return [sx, sy];
+}
+function drawMesh(cv, pts, ref){
+  const ctx=cv.getContext('2d');
+  ctx.clearRect(0,0,cv.width,cv.height);
+  // 参照(rest)网格,淡色
+  if (ref){
+    ctx.strokeStyle='rgba(120,130,160,0.25)'; ctx.lineWidth=1;
+    for (const t of tris){
+      ctx.beginPath();
+      let [sx,sy]=toScreen(ref[t[0]][0],ref[t[0]][1],cv); ctx.moveTo(sx,sy);
+      for (const id of t.slice(1)){ [sx,sy]=toScreen(ref[id][0],ref[id][1],cv); ctx.lineTo(sx,sy); }
+      ctx.closePath(); ctx.stroke();
+    }
+  }
+  // 当前网格
+  ctx.strokeStyle='#4a6a9a'; ctx.lineWidth=1.2;
+  for (const t of tris){
+    ctx.beginPath();
+    let [sx,sy]=toScreen(pts[t[0]][0],pts[t[0]][1],cv); ctx.moveTo(sx,sy);
+    for (const id of t.slice(1)){ [sx,sy]=toScreen(pts[id][0],pts[id][1],cv); ctx.lineTo(sx,sy); }
+    ctx.closePath(); ctx.stroke();
+  }
+  // 节点
+  for (let i=0;i<pts.length;i++){
+    const [sx,sy]=toScreen(pts[i][0],pts[i][1],cv);
+    const isFixed = fixed.includes(i);
+    const isLoad  = (i===loadNode);
+    ctx.fillStyle = isLoad ? '#ffd166' : (isFixed ? '#ff5f5f' : '#6fb3ff');
+    ctx.beginPath(); ctx.arc(sx,sy, isFixed?3.4:2.4, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+// ============ 9. 交互 + 主流程 ============
+const EInput=document.getElementById('E'), nuInput=document.getElementById('nu'), loadInput=document.getElementById('load');
+const EVal=document.getElementById('EVal'), nuVal=document.getElementById('nuVal'), loadVal=document.getElementById('loadVal');
+const info=document.getElementById('info');
+const cRest=document.getElementById('rest'), cDeform=document.getElementById('deform');
+
+function run(){
+  EVal.textContent=EInput.value;
+  nuVal.textContent=parseFloat(nuInput.value).toFixed(2);
+  loadVal.textContent=loadInput.value;
+  drawMesh(cRest, X, null);
+  const {x, iters, disp}=solve(parseFloat(loadInput.value));
+  drawMesh(cDeform, x, X);
+  info.textContent = `Newton 迭代 ${iters} 次收敛\n载荷点位移: ${disp.toFixed(4)}(向下)\nE=${EInput.value}, ν=${parseFloat(nuInput.value).toFixed(2)}`;
+}
+EInput.addEventListener('input', run);
+nuInput.addEventListener('input', run);
+loadInput.addEventListener('input', run);
+run();
+</script>
+</body>
+</html>

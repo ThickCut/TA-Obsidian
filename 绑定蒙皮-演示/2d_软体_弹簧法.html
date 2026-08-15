@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>2D 软体 · 弹簧法(Verlet + 距离约束)</title>
+<style>
+  body { margin:0; background:#16161f; color:#e8e8f0; font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  #wrap { display:flex; gap:20px; padding:20px; align-items:flex-start; }
+  canvas { background:#0f0f16; border:1px solid #2a2a3a; border-radius:8px; cursor:crosshair; }
+  #ui { width:260px; font-size:14px; line-height:1.6; }
+  #ui h3 { margin:0 0 10px; }
+  label { display:block; margin:10px 0; }
+  input[type=range] { width:100%; }
+  button { margin-top:8px; padding:6px 14px; background:#3a6ea5; color:#fff; border:none; border-radius:4px; cursor:pointer; }
+  p { color:#9aa0b0; font-size:13px; }
+  .val { color:#6fb3ff; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c" width="720" height="720"></canvas>
+  <div id="ui">
+    <h3>2D 软体 · 弹簧法</h3>
+    <p>一块由弹簧连成的"布/软体",顶端钉住,受重力下垂。<br>用鼠标<b>拖动顶点</b>看它如何回弹。</p>
+    <label><input type="checkbox" id="gravity" checked> 重力</label>
+    <label>刚度 <span class="val" id="stiffVal">0.5</span>
+      <input type="range" id="stiff" min="0.05" max="1" step="0.01" value="0.5"></label>
+    <label>阻尼 <span class="val" id="dampVal">0.99</span>
+      <input type="range" id="damp" min="0.90" max="1" step="0.001" value="0.99"></label>
+    <button id="reset">重置</button>
+    <p style="margin-top:16px">这是 FEM 的直觉前身:<br>把连续体看成很多弹簧。<br>弹簧法 = 质量点 + 弹簧 + Verlet;<br>FEM = 换成能量密度函数 + Newton。</p>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+// —— 显式获取 UI 控件 ——
+// 修复:此前误用不存在的 id(stiffSlider/dampSlider/resetBtn),
+// 脚本在 addEventListener 处抛错,导致动画循环从未启动、canvas 空白。
+const gravity     = document.getElementById('gravity');
+const stiffSlider = document.getElementById('stiff');
+const dampSlider  = document.getElementById('damp');
+const stiffVal    = document.getElementById('stiffVal');
+const dampVal     = document.getElementById('dampVal');
+const resetBtn    = document.getElementById('reset');
+
+const N = 16, spacing = 22;
+const ox = canvas.width/2 - (N-1)*spacing/2, oy = 90;
+
+let points = [], springs = [];
+function build() {
+  points = [];
+  for (let j=0;j<N;j++) for (let i=0;i<N;i++){
+    const x = ox + i*spacing, y = oy + j*spacing;
+    points.push({x, y, px:x, py:y, pinned: j===0});
+  }
+  const idx=(i,j)=>j*N+i;
+  springs = [];
+  for (let j=0;j<N;j++) for (let i=0;i<N;i++){
+    if (i<N-1) springs.push([idx(i,j), idx(i+1,j)]);           // 水平
+    if (j<N-1) springs.push([idx(i,j), idx(i,j+1)]);           // 垂直
+    if (i<N-1 && j<N-1){                                        // 对角(抗剪切)
+      springs.push([idx(i,j), idx(i+1,j+1)]);
+      springs.push([idx(i+1,j), idx(i,j+1)]);
+    }
+  }
+  springs = springs.map(([a,b])=>{
+    const dx=points[b].x-points[a].x, dy=points[b].y-points[a].y;
+    return [a,b,Math.hypot(dx,dy)];
+  });
+}
+build();
+
+function step() {
+  const grav = gravity.checked ? 0.35 : 0;
+  const damp = parseFloat(dampSlider.value);
+  const stiff = parseFloat(stiffSlider.value);
+
+  // 1. Verlet 积分
+  for (const p of points) {
+    if (p.pinned) continue;
+    const vx = (p.x - p.px) * damp;
+    const vy = (p.y - p.py) * damp;
+    p.px = p.x; p.py = p.y;
+    p.x += vx; p.y += vy + grav;
+  }
+  // 2. 距离约束迭代
+  for (let it=0; it<4; it++) {
+    for (const [a,b,L] of springs) {
+      const pa=points[a], pb=points[b];
+      let dx=pb.x-pa.x, dy=pb.y-pa.y;
+      let d=Math.hypot(dx,dy) || 1e-6;
+      const diff=(d-L)/d * 0.5 * stiff;
+      dx*=diff; dy*=diff;
+      if(!pa.pinned){pa.x+=dx; pa.y+=dy;}
+      if(!pb.pinned){pb.x-=dx; pb.y-=dy;}
+    }
+  }
+}
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = '#5a8fd0'; ctx.lineWidth = 1;
+  for (const [a,b] of springs) {
+    ctx.beginPath();
+    ctx.moveTo(points[a].x, points[a].y);
+    ctx.lineTo(points[b].x, points[b].y);
+    ctx.stroke();
+  }
+  for (const p of points) {
+    ctx.fillStyle = p.pinned ? '#ffd166' : '#ff5f5f';
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.pinned?3.5:2.2, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+let dragging = -1;
+canvas.addEventListener('mousedown', e=>{
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX-r.left, my = e.clientY-r.top;
+  let best=-1, bd=1e9;
+  points.forEach((p,i)=>{ const d=(p.x-mx)**2+(p.y-my)**2; if(d<bd){bd=d;best=i;} });
+  if (bd < 40*40) dragging = best;
+});
+canvas.addEventListener('mousemove', e=>{
+  if (dragging<0) return;
+  const r = canvas.getBoundingClientRect();
+  const p = points[dragging];
+  p.x = e.clientX-r.left; p.y = e.clientY-r.top;
+  p.px = p.x; p.py = p.y;
+});
+window.addEventListener('mouseup', ()=> dragging=-1);
+
+stiffSlider.addEventListener('input', ()=> stiffVal.textContent = stiffSlider.value);
+dampSlider.addEventListener('input', ()=> dampVal.textContent = dampSlider.value);
+resetBtn.addEventListener('click', build);
+
+function loop(){ step(); draw(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>
