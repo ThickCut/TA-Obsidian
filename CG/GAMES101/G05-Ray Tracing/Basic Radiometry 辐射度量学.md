@@ -8,8 +8,8 @@ Whitted Style Ray Tracing 无法保证正确性
 - Perform lighting calculations in a physically correct manner
 
 ## Radiant Energy and Flux (Power)
-![](attachments/img-01.png)
-![](attachments/img-02.png)
+![](img-01.png)
+![](img-02.png)
 基础物理量
 - Radiant energy: 能量，the energy of electromagnetic radiation
   - 符号：Q
@@ -84,7 +84,7 @@ $$
 **BRDF描述了从某个方向入射到一个点上的光线的能量会怎么反射，在不同的反射方向上会各分布多少能量**
 反射的理解：光线打到某个点，（被吸收了）然后反弹（发出）到其他地方
 Radiance from direction ωi turns into the power E that dA（某个点） receives,  Then power E will become the radiance to any other direction ωr
-![](attachments/img-03.png)
+![](img-03.png)
 能量一般指功率，即单位时间内的能量。
 某个点接受/发射光线总能量：Irradiance
 某个点从某个方向接受/向某个方向发射光线能量：radiance
@@ -102,7 +102,7 @@ BRDF的几个细节：
 - 定义了不同材质
 
 BRDF：represents how much light is reflected into each outgoing direction dL r (! r ) from each incoming direction
-![](attachments/img-04.png)
+![](img-04.png)
 $$
 f_{r}\left(\omega_{i} \rightarrow \omega_{r}\right)=\frac{\mathrm{d} L_{r}\left(\omega_{r}\right)}{\mathrm{d} E_{i}\left(\omega_{i}\right)}=\frac{\mathrm{d} L_{r}\left(\omega_{r}\right)}{L_{i}\left(\omega_{i}\right) \cos \theta_{i} \mathrm{d} \omega_{i}}\left[\frac{1}{\mathrm{sr}}\right]
 $$
@@ -128,13 +128,13 @@ $$
 - 怎么解这个方程呢？下节课
 
 单个点光源：
-![](attachments/img-05.png)
+![](img-05.png)
 多个点光源：加起来
-![](attachments/img-06.png)
+![](img-06.png)
 还有面光源：积分起来
-![](attachments/img-07.png)
+![](img-07.png)
 考虑其他物体反射的光线（把光源也包括在内了）：→递归
-![](attachments/img-08.png)
+![](img-08.png)
 $$
 L_{r}\left(x, \omega_{r}\right)=L_{e}\left(x, \omega_{r}\right)+\int_{\Omega} L_{r}\left(x^{\prime},-\omega_{i}\right) f\left(x, \omega_{i}, \omega_{r}\right) \cos \theta_{i} d \omega_{i}
 $$
@@ -144,9 +144,9 @@ I(u)=\theta(u)+\int l(v)K(u,v)dv
 $$
 通过算符的抽象还可极度简化成如下形式：L = E + KL （K：反射算符）其中L为未知数
 - Can be discretized to a simple matrix equation [or system of simultaneous linear equations] (L, E are vectors, K is the light transport matrix)
-![](attachments/img-09.png)
-![](attachments/img-10.png)
-![](attachments/img-11.png)
+![](img-09.png)
+![](img-10.png)
+![](img-11.png)
 - 光栅化的着色过程只有直接光照（间接光照需要间接计算）
 - 全局光照：直接和间接光照的集合
   - 会收敛到一个亮度
